@@ -158,6 +158,7 @@ set(TESTS
 	test_cactus
 	test_inconsistency_identifier
 	test_bit_packed_vector
+	test_dominance_max_index
 )
 
 if (${DEV}) 

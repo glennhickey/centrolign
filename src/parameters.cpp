@@ -37,6 +37,8 @@ Parameters::Parameters() {
     add_parameter(MatchFinding, "use_color_set_size", Bool, true, "Use Hui's (1992) color set size index instead of a merge sort tree (CSS is generally faster and uses less memory)");
     
     add_parameter(Anchoring, "max_num_match_pairs", Integer, 1250000, "The maximum number of matches between two graphs that will be considered during chaining");
+    add_parameter(Anchoring, "max_insert_chains", Integer, 0, "If nonzero, enter each anchor into the chaining search structures of only this many of the paths through it in each graph (an approximation that bounds the chaining work per anchor in well-aligned regions)");
+    add_parameter(Anchoring, "max_query_chains", Integer, 0, "If nonzero, look for each anchor's chaining predecessors through only this many of each graph's paths, the ones nearest the anchor (an approximation that makes chaining time per anchor independent of the number of sequences)");
     add_parameter(Anchoring, "memory_restraint_size", Integer, 1 << 30, "Switch to slower, more memory-efficient data structures when (graph size) * (num sequences) hits this amount");
     add_parameter(Anchoring, "split_matches_at_branchpoints", Bool, true, "Allow the chaining algorithm to split anchors at forking paths in the graph to avoid reachability artifacts");
     add_parameter(Anchoring, "anchor_split_limit", Integer, 5, "If splitting at branch points, how close to the end of the anchor must the split be");
@@ -175,6 +177,8 @@ void Parameters::apply(Core& core) const {
     core.anchorer.chaining_algorithm = parameter("chaining_algorithm").get<Anchorer::ChainAlgorithm>();
     core.anchorer.do_fill_in_anchoring = parameter("do_fill_in_anchoring").get<bool>();
     core.anchorer.max_num_match_pairs = parameter("max_num_match_pairs").get<int64_t>();
+    core.anchorer.max_query_chains = parameter("max_query_chains").get<int64_t>();
+    core.anchorer.max_insert_chains = parameter("max_insert_chains").get<int64_t>();
     core.anchorer.global_anchoring = parameter("global_anchoring").get<bool>();
     core.anchorer.split_matches_at_branchpoints = parameter("split_matches_at_branchpoints").get<bool>();
     core.anchorer.anchor_split_limit = parameter("anchor_split_limit").get<int64_t>();
@@ -406,6 +410,8 @@ void Parameters::validate() const {
     enforce_gt<int64_t>("threads", 0);
     enforce_gt<int64_t>("max_count", 0);
     enforce_gt<int64_t>("max_num_match_pairs", 0);
+    enforce_geq<int64_t>("max_query_chains", 0);
+    enforce_geq<int64_t>("max_insert_chains", 0);
     enforce_geq<int64_t>("memory_restraint_size", 0);
     enforce_range<int64_t>("anchor_score_function", 0,
                            container_max(std::vector<int>{ScoreFunction::InverseCount, ScoreFunction::LengthScaleInverseCount, ScoreFunction::ConcaveLengthScaleInverseCount, ScoreFunction::ConcaveLengthScaleCountDifference}));

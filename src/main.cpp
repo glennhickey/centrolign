@@ -65,6 +65,8 @@ int main(int argc, char** argv) {
     static const int opt_skip_calibration = 1000;
     static const int opt_force_gfa_output = 1001;
     static const int opt_bond_prefix = 1003;
+    static const int opt_max_query_chains = 1004;
+    static const int opt_max_insert_chains = 1005;
     while (true)
     {
         static struct option options[] = {
@@ -88,6 +90,8 @@ int main(int argc, char** argv) {
             {"skip-calibration", no_argument, NULL, opt_skip_calibration},
             {"force-gfa-output", no_argument, NULL, opt_force_gfa_output},
             {"bond-prefix", required_argument, NULL, opt_bond_prefix},
+            {"max-query-chains", required_argument, NULL, opt_max_query_chains},
+            {"max-insert-chains", required_argument, NULL, opt_max_insert_chains},
             {NULL, 0, NULL, 0}
         };
         int o = getopt_long(argc, argv, "T:A:S:s:cy:m:a:p:g:uv:C:GRt:h", options, NULL);
@@ -154,6 +158,12 @@ int main(int argc, char** argv) {
                 break;
             case opt_force_gfa_output:
                 force_gfa_output = true;
+                break;
+            case opt_max_query_chains:
+                params.set<int64_t>("max_query_chains", parse_int(optarg));
+                break;
+            case opt_max_insert_chains:
+                params.set<int64_t>("max_insert_chains", parse_int(optarg));
                 break;
             case opt_bond_prefix:
                 params.set<string>("bonds_prefix", optarg);

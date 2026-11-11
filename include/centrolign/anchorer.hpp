@@ -11,12 +11,15 @@
 #include <forward_list>
 #include <thread>
 #include <atomic>
+#include <algorithm>
+#include <unordered_map>
 
 #include "centrolign/chain_merge.hpp"
 #include "centrolign/modify_graph.hpp"
 #include "centrolign/gesa.hpp"
 #include "centrolign/max_search_tree.hpp"
 #include "centrolign/orthogonal_max_search_tree.hpp"
+#include "centrolign/dominance_max_index.hpp"
 #include "centrolign/topological_order.hpp"
 #include "centrolign/match_finder.hpp"
 #include "centrolign/subgraph_extraction.hpp"
@@ -165,6 +168,12 @@ public:
     std::array<double, 3> gap_extend{2.5, 0.1, 0.0015};
     // the max number of match pairs we will use for anchoring
     size_t max_num_match_pairs = 1000000;
+    // if nonzero, the sparse affine chaining algorithm looks for each anchor's predecessors through only
+    // this many chains of each graph: the ones nearest the anchor
+    size_t max_query_chains = 0;
+    // if nonzero, the sparse affine chaining algorithm inserts each anchor into the search trees of only
+    // this many of the chains through it in each graph
+    size_t max_insert_chains = 0;
     
     // split anchors at branch positions in the graph to avoid reachability artifacts
     bool split_matches_at_branchpoints = true;
@@ -1882,6 +1891,68 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
         logging::log(logging::Debug, "Computed post switch distances.");
     }
     
+    // only parallelize to the extent that there are graph2 chains to divide among the threads
+    const uint64_t num_threads = std::min<uint64_t>(std::max<uint64_t>(1, threads), xmerge2.chain_size());
+    const bool use_threads = num_threads > 1;
+    
+    // contiguous chain2 partition boundaries, one range per thread (including the main thread at index 0)
+    std::vector<uint64_t> partition_begin(num_threads), partition_end(num_threads);
+    for (uint64_t t = 0; t < num_threads; ++t) {
+        partition_begin[t] = (xmerge2.chain_size() * t) / num_threads;
+        partition_end[t] = (xmerge2.chain_size() * (t + 1)) / num_threads;
+    }
+    
+    // the chains to look for an anchor's predecessors through: all of them, or with max_query_chains,
+    // the ones nearest the anchor's first node in that graph by post-switch distance (0 for a chain
+    // through that node or through a node just before it).  ties go to the chain earliest in an order
+    // that deals graph2's chains out across the threads' chain2 ranges in turn, so that where most chains
+    // tie, as in a well-aligned stretch, the queries still spread over the threads
+    const bool limit_chains1 = max_query_chains != 0 && max_query_chains < xmerge1.chain_size();
+    const bool limit_chains2 = max_query_chains != 0 && max_query_chains < xmerge2.chain_size();
+    std::vector<uint64_t> tie_rank1(xmerge1.chain_size()), tie_rank2(xmerge2.chain_size());
+    for (uint64_t c = 0; c < tie_rank1.size(); ++c) {
+        tie_rank1[c] = c;
+    }
+    for (uint64_t t = 0; t < num_threads; ++t) {
+        for (uint64_t c = partition_begin[t]; c < partition_end[t]; ++c) {
+            tie_rank2[c] = (c - partition_begin[t]) * num_threads + t;
+        }
+    }
+    auto nearest_chains = [&](const XMerge& xmerge, const PostSwitchDistances<DistVector>& switch_dists,
+                              const std::vector<uint64_t>& tie_rank, uint64_t node_id,
+                              std::vector<uint64_t>& chains) {
+        std::vector<std::pair<size_t, uint64_t>> by_distance(xmerge.chain_size());
+        for (uint64_t c = 0; c < by_distance.size(); ++c) {
+            by_distance[c] = std::make_pair(switch_dists.distance(node_id, c), tie_rank[c]);
+        }
+        auto rank_order = range_vector(by_distance.size());
+        std::nth_element(rank_order.begin(), rank_order.begin() + max_query_chains, rank_order.end(),
+                         [&](size_t a, size_t b) { return by_distance[a] < by_distance[b]; });
+        chains.assign(rank_order.begin(), rank_order.begin() + max_query_chains);
+        std::sort(chains.begin(), chains.end());
+    };
+    // memos of the chains for each node that anchors start on, filled by the main thread as it builds
+    // each query batch (the workers only read them while it waits)
+    std::unordered_map<uint64_t, std::vector<uint64_t>> query_chains1, query_chains2;
+    // the chains of each graph that a match ending on a node is inserted into the search trees for: all
+    // the chains through the node, or with max_insert_chains, that many of them, the earliest by the same
+    // tie ranks that pick among equally near chains for queries
+    const bool limit_insert1 = max_insert_chains != 0 && max_insert_chains < xmerge1.chain_size();
+    const bool limit_insert2 = max_insert_chains != 0 && max_insert_chains < xmerge2.chain_size();
+    auto insert_chains = [&](const XMerge& xmerge, const std::vector<uint64_t>& tie_rank, bool limit,
+                             uint64_t node_id) -> std::vector<uint64_t> {
+        auto chains = xmerge.chains_on(node_id);
+        if (limit && chains.size() > max_insert_chains) {
+            std::nth_element(chains.begin(), chains.begin() + max_insert_chains, chains.end(),
+                             [&](uint64_t a, uint64_t b) { return tie_rank[a] < tie_rank[b]; });
+            chains.resize(max_insert_chains);
+            std::sort(chains.begin(), chains.end());
+        }
+        return chains;
+    };
+    auto insert_chains1 = [&](uint64_t node_id) { return insert_chains(xmerge1, tie_rank1, limit_insert1, node_id); };
+    auto insert_chains2 = [&](uint64_t node_id) { return insert_chains(xmerge2, tie_rank2, limit_insert2, node_id); };
+    
     // the gap contribution from a source anchor
     auto basic_source_shift = [&](uint64_t src_id1, uint64_t src_id2, uint64_t path1, uint64_t path2) -> IntShift {
         return xmerge1.index_on(src_id1, path1) - xmerge2.index_on(src_id2, path2);
@@ -2009,7 +2080,90 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
         return_val.second = score_gap(return_val.first);
         return return_val;
     };
-        
+
+    // measure_gap_sn from the sources to each match, with the lookups that depend only on a source or
+    // only on the match done once rather than for every combination of sources and their chains
+    struct SourceChains {
+        uint64_t node_id;
+        // the chains through the source, in chains_on order, and its index on each
+        std::vector<std::pair<uint64_t, size_t>> chain_index;
+    };
+    auto get_source_chains = [](const XMerge& xmerge, const std::vector<uint64_t>& sources,
+                                std::vector<bool>& on_chain) {
+        std::vector<SourceChains> source_chains(sources.size());
+        on_chain.assign(xmerge.chain_size(), false);
+        for (size_t i = 0; i < sources.size(); ++i) {
+            source_chains[i].node_id = sources[i];
+            for (auto p : xmerge.chains_on(sources[i])) {
+                source_chains[i].chain_index.emplace_back(p, xmerge.index_on(sources[i], p));
+                on_chain[p] = true;
+            }
+        }
+        return source_chains;
+    };
+    std::vector<SourceChains> source_chains1, source_chains2;
+    std::vector<bool> source_on_chain1, source_on_chain2;
+    if (sources1) {
+        source_chains1 = get_source_chains(xmerge1, *sources1, source_on_chain1);
+        source_chains2 = get_source_chains(xmerge2, *sources2, source_on_chain2);
+    }
+    // scratch space for the match's side of the measurement, by chain
+    std::vector<size_t> lead_pred1(xmerge1.chain_size()), lead_pred2(xmerge2.chain_size());
+    std::vector<size_t> lead_dist1(xmerge1.chain_size()), lead_dist2(xmerge2.chain_size());
+    std::vector<bool> lead_reach1, lead_reach2;
+    auto measure_lead_gap = [&](uint64_t curr_id1, uint64_t curr_id2) -> std::pair<IntShift, ScoreFloat> {
+
+        lead_reach1.resize(source_chains1.size());
+        for (size_t i = 0; i < source_chains1.size(); ++i) {
+            uint64_t prev_id1 = source_chains1[i].node_id;
+            lead_reach1[i] = (prev_id1 == curr_id1 || xmerge1.reachable(prev_id1, curr_id1));
+        }
+        lead_reach2.resize(source_chains2.size());
+        for (size_t i = 0; i < source_chains2.size(); ++i) {
+            uint64_t prev_id2 = source_chains2[i].node_id;
+            lead_reach2[i] = (prev_id2 == curr_id2 || xmerge2.reachable(prev_id2, curr_id2));
+        }
+        for (uint64_t p1 = 0; p1 < xmerge1.chain_size(); ++p1) {
+            if (source_on_chain1[p1]) {
+                lead_pred1[p1] = xmerge1.predecessor_index(curr_id1, p1);
+                lead_dist1[p1] = switch_dists1.distance(curr_id1, p1);
+            }
+        }
+        for (uint64_t p2 = 0; p2 < xmerge2.chain_size(); ++p2) {
+            if (source_on_chain2[p2]) {
+                lead_pred2[p2] = xmerge2.predecessor_index(curr_id2, p2);
+                lead_dist2[p2] = switch_dists2.distance(curr_id2, p2);
+            }
+        }
+
+        // the same combinations, in the same order, with the same arithmetic as measure_gap_sn
+        std::pair<IntShift, ScoreFloat> return_val(std::numeric_limits<IntShift>::max(), mininf);
+        for (size_t i = 0; i < source_chains1.size(); ++i) {
+            for (size_t j = 0; j < source_chains2.size(); ++j) {
+                IntShift gap_here = std::numeric_limits<IntShift>::max();
+                if (lead_reach1[i] && lead_reach2[j]) {
+                    for (const auto& chain_index1 : source_chains1[i].chain_index) {
+                        uint64_t p1 = chain_index1.first;
+                        for (const auto& chain_index2 : source_chains2[j].chain_index) {
+                            uint64_t p2 = chain_index2.first;
+                            IntShift source_shift = chain_index1.second - chain_index2.second;
+                            IntShift query_shift = lead_pred1[p1] - lead_pred2[p2] + lead_dist1[p1] - lead_dist2[p2];
+                            IntShift gap = source_shift - query_shift;
+                            if (std::abs(gap) < std::abs(gap_here)) {
+                                gap_here = gap;
+                            }
+                        }
+                    }
+                }
+                if (std::abs(gap_here) < return_val.first) {
+                    return_val.first = gap_here;
+                }
+            }
+        }
+        return_val.second = score_gap(return_val.first);
+        return return_val;
+    };
+
     // for each path1, for each path2, list of (search index, value)
     std::vector<std::vector<std::vector<std::tuple<key_t, UIntDist, ScoreFloat>>>> search_tree_data;
     search_tree_data.resize(xmerge1.chain_size(), std::vector<std::vector<std::tuple<key_t, UIntDist, ScoreFloat>>>(xmerge2.chain_size()));
@@ -2038,8 +2192,7 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
             
             // TODO: could i get rid of these loops by querying the structure somehow?
             
-            ScoreFloat lead_indel_score = measure_gap_sn(*sources1, *sources2,
-                                                         match_bank.walk1(*it).front(), match_bank.walk2(*it).front()).second;
+            ScoreFloat lead_indel_score = measure_lead_gap(match_bank.walk1(*it).front(), match_bank.walk2(*it).front()).second;
             if (lead_indel_score == mininf) {
                 // this anchor was not reachable
                 weight = mininf;
@@ -2051,8 +2204,8 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
         
         match_bank.update_dp(*it, weight, match_bank.max());
         
-        for (auto p1 : xmerge1.chains_on(match_bank.walk1(*it).back())) {
-            for (auto p2 : xmerge2.chains_on(match_bank.walk2(*it).back())) {
+        for (auto p1 : insert_chains1(match_bank.walk1(*it).back())) {
+            for (auto p2 : insert_chains2(match_bank.walk2(*it).back())) {
                 // initialize the sparse value data
                 search_tree_data[p1][p2].emplace_back(get_key(*it, p1, p2), get_key_offset(*it, p2), mininf);
             }
@@ -2090,178 +2243,139 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
     if (!suppress_verbose_logging) {
         logging::log(logging::Debug, "Initializing sparse query data structures");
     }
-    static const bool verbose_memory = false;
-    
-    // grids of search trees over (path1, path2) where scores correspond to different distance scenaries
-    // odds        d1 > d2
-    // evens       d1 < d2
-    using OrthoMaxTree = OrthogonalMaxSearchTree<key_t, UIntDist, ScoreFloat, UIntAnchor, ShiftMatchVector, DistVector, std::vector<ScoreFloat>, AnchorVector>;
-    std::array<std::vector<std::vector<OrthoMaxTree>>, 2 * NumPW> search_trees;
+
+    // the gapped query structures: for each path1, for each path2, the matches in order of their
+    // (shift, match) keys, which gives each its rank. one index over them answers queries for matches
+    // on lower diagonals than the query (d1 > d2), and another, over the reverse order, for matches on
+    // higher diagonals (d1 < d2). each match holds a value for each piece of the gap penalty
+    using GapIndex = DominanceMaxIndex<UIntDist, ScoreFloat, NumPW, UIntAnchor>;
+    struct GappedIndexes {
+        ShiftMatchVector keys;
+        GapIndex lower; // ranks in key order
+        GapIndex upper; // ranks in reverse key order
+    };
+    std::vector<std::vector<GappedIndexes>> gapped_indexes(xmerge1.chain_size(),
+                                                           std::vector<GappedIndexes>(xmerge2.chain_size()));
     for (uint64_t p1 = 0; p1 < xmerge1.chain_size(); ++p1) {
         for (uint64_t p2 = 0; p2 < xmerge2.chain_size(); ++p2) {
-            for (size_t pw = 0; pw < 2 * NumPW; ++pw) {
-                auto& pw_trees = search_trees[pw];
-                if (p1 == 0 && p2 == 0) {
-                    pw_trees.resize(xmerge1.chain_size());
-                }
-                auto& tree_row = pw_trees[p1];
-                if (p2 == 0) {
-                    tree_row.reserve(xmerge2.chain_size());
-                }
-                tree_row.emplace_back(search_tree_data[p1][p2]);
-                if (verbose_memory && !suppress_verbose_logging) {
-                    logging::log(logging::Debug, "Search tree for path combination (" + std::to_string(p1) + ", " + std::to_string(p2) + ") in piece-wise component " + std::to_string(pw) + " is occupying " + format_memory_usage(tree_row.back().memory_size()) + ".");
-                    logging::log(logging::Debug, "Current memory usage is " + format_memory_usage(current_memory_usage()) + ".");
-                }
+            auto& data = search_tree_data[p1][p2];
+            std::sort(data.begin(), data.end(), [](const std::tuple<key_t, UIntDist, ScoreFloat>& a,
+                                                   const std::tuple<key_t, UIntDist, ScoreFloat>& b) {
+                return std::get<0>(a) < std::get<0>(b);
+            });
+            auto& indexes = gapped_indexes[p1][p2];
+            indexes.keys = ShiftMatchVector(data.size());
+            std::vector<UIntDist> offsets(data.size());
+            for (size_t i = 0; i < data.size(); ++i) {
+                indexes.keys[i] = std::get<0>(data[i]);
+                offsets[i] = std::get<1>(data[i]);
             }
             {
                 // clear the data
-                auto dummy = std::move(search_tree_data[p1][p2]);
+                auto dummy = std::move(data);
             }
+            indexes.lower = GapIndex(offsets);
+            std::reverse(offsets.begin(), offsets.end());
+            indexes.upper = GapIndex(offsets);
         }
     }
-    
-    
+
     // clear the search tree data
     {
         decltype(search_tree_data) dummy = std::move(search_tree_data);
     }
-    
-    
-    if (logging::level >= logging::Debug && !suppress_verbose_logging) {
-        size_t gapped_tree_mem_size = 0;
-        for (size_t pw = 0; pw < 2 * NumPW; ++pw) {
-            const auto& pw_trees = search_trees[pw];
-            for (uint64_t p1 = 0; p1 < xmerge1.chain_size(); ++p1) {
-                const auto& tree_row = pw_trees[p1];
-                for (uint64_t p2 = 0; p2 < xmerge2.chain_size(); ++p2) {
-                    gapped_tree_mem_size += tree_row[p2].memory_size();
-                }
+
+    // the number of keys less than this one
+    auto key_rank = [](const ShiftMatchVector& keys, const key_t& key) -> size_t {
+        size_t lo = 0, hi = keys.size();
+        while (lo < hi) {
+            size_t mid = (lo + hi) / 2;
+            if (key_t(keys[mid]) < key) {
+                lo = mid + 1;
+            }
+            else {
+                hi = mid;
             }
         }
-        
+        return lo;
+    };
+
+    if (logging::level >= logging::Debug && !suppress_verbose_logging) {
+        size_t gapped_tree_mem_size = 0;
+        for (const auto& index_row : gapped_indexes) {
+            for (const auto& indexes : index_row) {
+                gapped_tree_mem_size += get_vec_memory_size(indexes.keys) + indexes.lower.memory_size() + indexes.upper.memory_size();
+            }
+        }
+
         logging::log(logging::Debug, "Gapped sparse query structures are occupying " + format_memory_usage(gapped_tree_mem_size) + " of memory.");
         logging::log(logging::Debug, "Current memory usage is " + format_memory_usage(current_memory_usage()) + ".");
     }
     
-    // for each path1, for each path2, for each shift value, list of (offset, value)
-    // note: using forward_list because in practice, most of these end up empty and forward_list has a small memory footprint
-    std::vector<std::vector<std::deque<std::forward_list<std::pair<gf_key_t, ScoreFloat>>>>> gap_free_search_tree_data;
-    gap_free_search_tree_data.resize(xmerge1.chain_size(), std::vector<std::deque<std::forward_list<std::pair<gf_key_t, ScoreFloat>>>>(xmerge2.chain_size()));
-    // for each path1, for each path2, shift value represented by the start of the corresponding deque
-    std::vector<std::vector<IntShift>> min_shift(xmerge1.chain_size(), std::vector<IntShift>(xmerge2.chain_size(), 0));
-    
-    for (auto it = match_bank.begin(), end = match_bank.end(); it != end; ++it) {
-        for (auto p1 : xmerge1.chains_on(match_bank.walk1(*it).back())) {
-            for (auto p2 : xmerge2.chains_on(match_bank.walk2(*it).back())) {
-                
-                // initialize the gap free value in its appropriate bank
-                auto shift = source_shift(*it, p1, p2);
-                if (debug_anchorer) {
-                    std::cerr << "adding match to gap free data for shift " << shift << " on chain combo " << p1 << ", " << p2 << '\n';
-                }
-                auto& gf_data = gap_free_search_tree_data[p1][p2];
-                auto& gf_data_min = min_shift[p1][p2];
-                if (gf_data.empty()) {
-                    gf_data_min = shift;
-                    gf_data.emplace_front();
-                    gf_data.front().emplace_front(get_gap_free_key(*it, p2), mininf);
-                }
-                else {
-                    while (gf_data_min > shift) {
-                        gf_data.emplace_front();
-                        --gf_data_min;
-                    }
-                    while (gf_data_min + IntShift(gf_data.size()) <= shift) {
-                        gf_data.emplace_back();
-                    }
-                    
-                    gf_data[shift - gf_data_min].emplace_front(get_gap_free_key(*it, p2), mininf);
-                }
-            }
-        }
-    }
-    
-    if (logging::level >= logging::Debug && !suppress_verbose_logging) {
-        // measure fine grain memory usage from local structs
-        
-        // search tree data
-        size_t search_data_size = sizeof(gap_free_search_tree_data) + gap_free_search_tree_data.capacity() * sizeof(typename decltype(gap_free_search_tree_data)::value_type);
-        for (const auto& data_row : gap_free_search_tree_data) {
-            search_data_size += data_row.capacity() * sizeof(typename decltype(gap_free_search_tree_data)::value_type::value_type);
-            for (const auto& diagonals : data_row) {
-                // TODO: this is not a great estimate of how much space a deque uses...
-                search_data_size += diagonals.size() * sizeof(typename decltype(gap_free_search_tree_data)::value_type::value_type::value_type);
-                for (const auto& diagonal_data : diagonals) {
-                    for (const auto& data_point : diagonal_data) {
-                        search_data_size += sizeof(void*) + sizeof(typename decltype(gap_free_search_tree_data)::value_type::value_type::value_type::value_type);
-                    }
-                }
-            }
-        }
-        
-        logging::log(logging::Debug, "Initialized ungapped search tree data is occupying " + format_memory_usage(search_data_size) + ".");
-    }
-    
-    // for each path1, for each path2, for each shift value, a search tree
+    // the ungapped query structures: for each path1, for each path2, a search tree for each diagonal
+    // (shift) that has matches, over their offsets on path2.  only those diagonals are kept, with their
+    // shifts sorted for lookup, rather than a slot for every shift in the range
     using MaxTree = MaxSearchTree<gf_key_t, ScoreFloat, DistMatchVector, std::vector<ScoreFloat>, AnchorVector>;
-    std::vector<std::vector<std::vector<std::unique_ptr<MaxTree>>>> gap_free_search_trees;
-    gap_free_search_trees.resize(xmerge1.chain_size());
-    
-    for (uint64_t p1 = 0; p1 < xmerge1.chain_size(); ++p1) {
-        gap_free_search_trees[p1].resize(xmerge2.chain_size());
-        for (uint64_t p2 = 0; p2 < xmerge2.chain_size(); ++p2) {
-            auto& tree_bank = gap_free_search_trees[p1][p2];
-            auto& tree_data_lists = gap_free_search_tree_data[p1][p2];
-            tree_bank.resize(tree_data_lists.size());
-            for (size_t i = 0; i < tree_data_lists.size(); ++i) {
-                // copy the data into a vector
-                if (!tree_data_lists[i].empty()) {
-                    
-                    std::vector<std::pair<gf_key_t, ScoreFloat>> tree_data_vec(tree_data_lists[i].begin(), tree_data_lists[i].end());
-                    tree_bank[i].reset(new MaxTree(tree_data_vec));
-                    // clear this data list
-                    auto dummy = std::move(tree_data_lists[i]);
+    struct DiagonalTrees {
+        std::vector<IntShift> shifts;
+        std::vector<MaxTree> trees;
+        // the tree of a diagonal, or null if it has no matches
+        inline const MaxTree* find(IntShift shift) const {
+            auto it = std::lower_bound(shifts.begin(), shifts.end(), shift);
+            return (it != shifts.end() && *it == shift) ? &trees[it - shifts.begin()] : nullptr;
+        }
+        inline MaxTree* find(IntShift shift) {
+            auto it = std::lower_bound(shifts.begin(), shifts.end(), shift);
+            return (it != shifts.end() && *it == shift) ? &trees[it - shifts.begin()] : nullptr;
+        }
+    };
+    std::vector<std::vector<DiagonalTrees>> gap_free_search_trees(xmerge1.chain_size(),
+                                                                  std::vector<DiagonalTrees>(xmerge2.chain_size()));
+    {
+        // (shift, key, value) for each match on each pair of paths
+        std::vector<std::vector<std::vector<std::tuple<IntShift, gf_key_t, ScoreFloat>>>> gap_free_search_tree_data(xmerge1.chain_size(),
+                                                                                                                  std::vector<std::vector<std::tuple<IntShift, gf_key_t, ScoreFloat>>>(xmerge2.chain_size()));
+        for (auto it = match_bank.begin(), end = match_bank.end(); it != end; ++it) {
+            for (auto p1 : insert_chains1(match_bank.walk1(*it).back())) {
+                for (auto p2 : insert_chains2(match_bank.walk2(*it).back())) {
+                    gap_free_search_tree_data[p1][p2].emplace_back(source_shift(*it, p1, p2), get_gap_free_key(*it, p2), mininf);
                 }
-            }
-            {
-                // clear the bank of data lists
-                auto dummy = std::move(tree_data_lists);
-            }
-            
-            if (verbose_memory && !suppress_verbose_logging) {
-                size_t mem_size = 0;
-                size_t num_nonempty = 0;
-                size_t total_matches = 0;
-                for (const auto& tree : tree_bank) {
-                    if (tree.get()) {
-                        mem_size += tree->memory_size();
-                        num_nonempty += (tree->empty() ? 0 : 1);
-                        total_matches += tree->size();
-                    }
-                }
-                logging::log(logging::Debug, "Ungapped sparse query structures for path combination (" + std::to_string(p1) + ", " + std::to_string(p2) + ") are occupying " + format_memory_usage(mem_size) + " of memory with " + std::to_string(num_nonempty) + " nonempty trees out of " + std::to_string(tree_bank.size()) + " total, which contain a total of " + std::to_string(total_matches) + " matches.");
-                logging::log(logging::Debug, "Current memory usage is " + format_memory_usage(current_memory_usage()) + ".");
             }
         }
-        
-    }
-    // clear the search tree data
-    {
-        decltype(gap_free_search_tree_data) dummy = std::move(gap_free_search_tree_data);
-    }
-    
-    
-    if (logging::level >= logging::Debug && !suppress_verbose_logging) {
-        
-        size_t ungapped_tree_mem_size = 0;
         for (uint64_t p1 = 0; p1 < xmerge1.chain_size(); ++p1) {
             for (uint64_t p2 = 0; p2 < xmerge2.chain_size(); ++p2) {
-                ungapped_tree_mem_size += gap_free_search_trees[p1][p2].capacity() * sizeof(typename decltype(gap_free_search_trees)::value_type::value_type);
-                for (const auto& tree_ptr : gap_free_search_trees[p1][p2]) {
-                    if (tree_ptr.get()) {
-                        ungapped_tree_mem_size += tree_ptr->memory_size();
+                auto& data = gap_free_search_tree_data[p1][p2];
+                // group by shift, keeping the order of the matches within a shift
+                std::stable_sort(data.begin(), data.end(), [](const std::tuple<IntShift, gf_key_t, ScoreFloat>& a,
+                                                              const std::tuple<IntShift, gf_key_t, ScoreFloat>& b) {
+                    return std::get<0>(a) < std::get<0>(b);
+                });
+                auto& diagonals = gap_free_search_trees[p1][p2];
+                for (size_t i = 0; i < data.size();) {
+                    size_t j = i;
+                    std::vector<std::pair<gf_key_t, ScoreFloat>> tree_data;
+                    for (; j < data.size() && std::get<0>(data[j]) == std::get<0>(data[i]); ++j) {
+                        tree_data.emplace_back(std::get<1>(data[j]), std::get<2>(data[j]));
                     }
+                    diagonals.shifts.push_back(std::get<0>(data[i]));
+                    diagonals.trees.emplace_back(tree_data);
+                    i = j;
+                }
+                diagonals.shifts.shrink_to_fit();
+                diagonals.trees.shrink_to_fit();
+                // clear the data
+                auto dummy = std::move(data);
+            }
+        }
+    }
+    
+    if (logging::level >= logging::Debug && !suppress_verbose_logging) {
+        size_t ungapped_tree_mem_size = 0;
+        for (const auto& tree_row : gap_free_search_trees) {
+            for (const auto& diagonals : tree_row) {
+                ungapped_tree_mem_size += diagonals.shifts.capacity() * sizeof(IntShift) + diagonals.trees.capacity() * sizeof(MaxTree);
+                for (const auto& tree : diagonals.trees) {
+                    ungapped_tree_mem_size += tree.memory_size();
                 }
             }
         }
@@ -2311,56 +2425,55 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
         ScoreFloat dp_val;
     };
 
-    // a single unit of query work: a match starting past a forward edge, with its precomputed weight
+    // a single unit of query work: a match starting past a forward edge, with its precomputed weight,
+    // and the chains of graph2 to query through (sorted), or null for all of them
     struct QueryItem {
         match_id_t match_id;
         uint64_t chain1;
         ScoreFloat weight;
+        const std::vector<uint64_t>* chains2;
     };
 
     // load the DP values of the update batch into the search trees over a contiguous chain2 range.
     // only touches trees in that range, so it is safe to run concurrently across disjoint chain2 ranges.
-    auto run_updates = [&](const std::vector<UpdateItem>& update_batch, uint64_t chain2_begin, uint64_t chain2_end) {
+    auto run_updates = [&](const std::vector<UpdateItem>& update_batch, uint64_t chain2_begin, uint64_t chain2_end,
+                           uint64_t& num_updates) {
         for (const auto& item : update_batch) {
             const auto& match_id = item.match_id;
             ScoreFloat dp_val = item.dp_val;
-            for (auto p1 : xmerge1.chains_on(match_bank.walk1(match_id).back())) {
-                for (auto p2 : xmerge2.chains_on(match_bank.walk2(match_id).back())) {
+            for (auto p1 : insert_chains1(match_bank.walk1(match_id).back())) {
+                for (auto p2 : insert_chains2(match_bank.walk2(match_id).back())) {
                     if (p2 < chain2_begin || p2 >= chain2_end) {
                         // another partition is responsible for this tree
                         continue;
                     }
 
+                    ++num_updates;
                     auto key1 = get_key(match_id, p1, p2);
-                    auto key2 = get_key_offset(match_id, p2);
 
                     if (debug_anchorer) {
-                        std::cerr << "extending for path combo " << p1 << ',' << p2 << ", giving shift key " << key1.first << " and offset key " << key2 << '\n';
+                        std::cerr << "extending for path combo " << p1 << ',' << p2 << ", giving shift key " << key1.first << " and offset key " << get_key_offset(match_id, p2) << '\n';
                     }
                     auto shift = source_shift(match_id, p1, p2);
                     {
                         // update the within diagonal search tree
-                        auto& tree = gap_free_search_trees[p1][p2][shift - min_shift[p1][p2]];
+                        auto tree = gap_free_search_trees[p1][p2].find(shift);
                         auto it = tree->find(get_gap_free_key(match_id, p2));
                         tree->update(it, dp_val);
                     }
-                    for (size_t pw = 0; pw < 2 * NumPW; ++pw) {
-                        // save the anchor-independent portion of the score in the search tree
-                        ScoreFloat value;
-                        if (pw % 2 == 1) {
+                    {
+                        // save the anchor-independent portion of the score for each piece of the gap penalty
+                        std::array<ScoreFloat, NumPW> lower_values, upper_values;
+                        for (size_t pw = 0; pw < NumPW; ++pw) {
                             // d1 > d2
-                            value = dp_val + local_scale * gap_extend[pw / 2] * shift;
-                        }
-                        else {
+                            lower_values[pw] = dp_val + local_scale * gap_extend[pw] * shift;
                             // d1 < d2
-                            value = dp_val - local_scale * gap_extend[pw / 2] * shift;
+                            upper_values[pw] = dp_val - local_scale * gap_extend[pw] * shift;
                         }
-                        auto& tree = search_trees[pw][p1][p2];
-                        auto it = tree.find(key1, key2);
-                        if (value > std::get<2>(*it)) {
-                            // TODO: shouldn't this condition always be met, since keys are unique to a match pair?
-                            tree.update(it, value);
-                        }
+                        auto& indexes = gapped_indexes[p1][p2];
+                        size_t rank = key_rank(indexes.keys, key1);
+                        indexes.lower.update(rank, lower_values);
+                        indexes.upper.update(indexes.keys.size() - 1 - rank, upper_values);
                     }
                 }
             }
@@ -2371,7 +2484,8 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
     // item into results (indexed parallel to query_batch). does not touch match_bank, so it is
     // safe to run concurrently across disjoint chain2 ranges.
     auto run_partition = [&](const std::vector<QueryItem>& query_batch, uint64_t chain2_begin,
-                             uint64_t chain2_end, std::vector<std::pair<ScoreFloat, match_id_t>>& results) {
+                             uint64_t chain2_end, std::vector<std::pair<ScoreFloat, match_id_t>>& results,
+                             uint64_t& num_queries) {
         for (size_t i = 0; i < query_batch.size(); ++i) {
             const auto& item = query_batch[i];
             const auto& match_id = item.match_id;
@@ -2379,16 +2493,16 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
             ScoreFloat weight = item.weight;
             ScoreFloat best_val = results[i].first;
             match_id_t best_bp = results[i].second;
-            for (uint64_t chain2 = chain2_begin; chain2 < chain2_end; ++chain2) {
+            auto query_chain2 = [&](uint64_t chain2) {
                 // note: we have to check all of the chains because the best distance measure might
                 // not originate from a path that contains the head of the path
-                
+                ++num_queries;
                 IntShift query = query_shift(match_id, chain1, chain2);
                 UIntDist offset = get_query_offset(match_id, chain2);
-                if (query >= min_shift[chain1][chain2] && query - min_shift[chain1][chain2] < gap_free_search_trees[chain1][chain2].size()) {
+                {
                     // check within the same diagonal
-                    const auto& tree = gap_free_search_trees[chain1][chain2][query - min_shift[chain1][chain2]];
-                    if (tree.get()) {
+                    const auto tree = gap_free_search_trees[chain1][chain2].find(query);
+                    if (tree) {
                         auto it = tree->range_max(gf_key_t(0, match_bank.min()), gf_key_t(offset, match_bank.min()));
                         if (it != tree->end()) {
                             ScoreFloat value = (*it).second + weight;
@@ -2399,35 +2513,45 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
                         }
                     }
                 }
-                for (size_t pw = 0; pw < 2 * NumPW; ++pw) {
+                {
                     // combine the anchor-dependent and anchor-independent portions of the score
-                    const auto& tree = search_trees[pw][chain1][chain2];
-                    
-                    if (pw % 2 == 1) {
-                        // d1 > d2, search leftward of the query value
-                        auto it = tree.range_max(key_t(std::numeric_limits<IntShift>::min(), match_bank.min()),
-                                                 key_t(query, match_bank.min()),
-                                                 0, offset);
-                        if (it != tree.end()) {
-                            ScoreFloat value = std::get<2>(*it) + weight - local_scale * (gap_open[pw / 2] + gap_extend[pw / 2] * query);
+                    const auto& indexes = gapped_indexes[chain1][chain2];
+                    size_t n = indexes.keys.size();
+                    std::array<ScoreFloat, NumPW> lower_max, upper_max;
+                    std::array<UIntAnchor, NumPW> lower_rank, upper_rank;
+                    // d1 > d2, search leftward of the query value
+                    indexes.lower.prefix_max(key_rank(indexes.keys, key_t(query, match_bank.min())),
+                                             offset, lower_max, lower_rank);
+                    // d1 < d2, search rightward of it
+                    indexes.upper.prefix_max(n - key_rank(indexes.keys, key_t(query + 1, match_bank.min())),
+                                             offset, upper_max, upper_rank);
+                    for (size_t pw = 0; pw < NumPW; ++pw) {
+                        if (upper_rank[pw] != n) {
+                            ScoreFloat value = upper_max[pw] + weight - local_scale * (gap_open[pw] - gap_extend[pw] * query);
                             if (value > best_val) {
                                 best_val = value;
-                                best_bp = std::get<0>(*it).second;
+                                best_bp = key_t(indexes.keys[n - 1 - upper_rank[pw]]).second;
+                            }
+                        }
+                        if (lower_rank[pw] != n) {
+                            ScoreFloat value = lower_max[pw] + weight - local_scale * (gap_open[pw] + gap_extend[pw] * query);
+                            if (value > best_val) {
+                                best_val = value;
+                                best_bp = key_t(indexes.keys[lower_rank[pw]]).second;
                             }
                         }
                     }
-                    else {
-                        auto it = tree.range_max(key_t(query + 1, match_bank.min()),
-                                                 key_t(std::numeric_limits<IntShift>::max(), match_bank.max()),
-                                                 0, offset);
-                        if (it != tree.end()) {
-                            ScoreFloat value = std::get<2>(*it) + weight - local_scale * (gap_open[pw / 2] - gap_extend[pw / 2] * query);
-                            if (value > best_val) {
-                                best_val = value;
-                                best_bp = std::get<0>(*it).second;
-                            }
-                        }
-                    }
+                }
+            };
+            if (item.chains2) {
+                for (auto c = std::lower_bound(item.chains2->begin(), item.chains2->end(), chain2_begin);
+                     c != item.chains2->end() && *c < chain2_end; ++c) {
+                    query_chain2(*c);
+                }
+            }
+            else {
+                for (uint64_t chain2 = chain2_begin; chain2 < chain2_end; ++chain2) {
+                    query_chain2(chain2);
                 }
             }
             results[i].first = best_val;
@@ -2435,16 +2559,14 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
         }
     };
     
-    // only parallelize to the extent that
-    const uint64_t num_threads = std::min<uint64_t>(std::max<uint64_t>(1, threads), xmerge2.chain_size());
-    const bool use_threads = num_threads > 1;
-    
-    // contiguous chain2 partition boundaries, one range per thread (including the main thread at index 0)
-    std::vector<uint64_t> partition_begin(num_threads), partition_end(num_threads);
-    for (uint64_t t = 0; t < num_threads; ++t) {
-        partition_begin[t] = (xmerge2.chain_size() * t) / num_threads;
-        partition_end[t] = (xmerge2.chain_size() * (t + 1)) / num_threads;
-    }
+    std::vector<uint64_t> thread_num_queries(num_threads, 0), thread_num_updates(num_threads, 0);
+    auto total = [](const std::vector<uint64_t>& counts) {
+        uint64_t n = 0;
+        for (auto c : counts) {
+            n += c;
+        }
+        return n;
+    };
     
     // shared state for dispatching batches to persistent workers
     std::vector<UpdateItem> update_batch;
@@ -2477,8 +2599,9 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
                         std::this_thread::yield();
                     }
                     // updates must precede queries, but both only touch this worker's chain2 range
-                    run_updates(update_batch, partition_begin[w], partition_end[w]);
-                    run_partition(query_batch, partition_begin[w], partition_end[w], thread_results[w]);
+                    run_updates(update_batch, partition_begin[w], partition_end[w], thread_num_updates[w]);
+                    run_partition(query_batch, partition_begin[w], partition_end[w], thread_results[w],
+                                  thread_num_queries[w]);
                     workers_done.fetch_add(1);
                 }
             });
@@ -2493,7 +2616,7 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
         
         ++iter;
         if (logging::level >= logging::Verbose && iter % 250000 == 0 && !suppress_verbose_logging) {
-            logging::log(logging::Verbose, "Iteration " + std::to_string(iter) + " of " + std::to_string(graph1.node_size()) + " in sparse chaining algorithm.");
+            logging::log(logging::Verbose, "Iteration " + std::to_string(iter) + " of " + std::to_string(graph1.node_size()) + " in sparse chaining algorithm (" + std::to_string(total(thread_num_queries)) + " queries, " + std::to_string(total(thread_num_updates)) + " updates so far).");
         }
         
         if (debug_anchorer) {
@@ -2527,6 +2650,18 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
                 std::cerr << "there is a forward edge to " << fwd_id << ", from node " << node_id << " on chain " << chain1 << '\n';
             }
             
+            if (limit_chains1) {
+                auto it = query_chains1.find(fwd_id);
+                if (it == query_chains1.end()) {
+                    it = query_chains1.emplace(fwd_id, std::vector<uint64_t>()).first;
+                    nearest_chains(xmerge1, switch_dists1, tie_rank1, fwd_id, it->second);
+                }
+                if (!std::binary_search(it->second.begin(), it->second.end(), chain1)) {
+                    // not one of the chains to look for predecessors through
+                    continue;
+                }
+            }
+            
             for (const auto& match_id : match_bank.starts_on(fwd_id)) {
                 // an anchor starts here in graph1
                 
@@ -2536,7 +2671,18 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
                 ScoreFloat weight = score_function->anchor_weight(match_set.count1, match_set.count2,
                                                                   match_set.walks1.front().size(), match_set.full_length);
                 
-                query_batch.push_back(QueryItem{match_id, chain1, weight});
+                const std::vector<uint64_t>* chains2 = nullptr;
+                if (limit_chains2) {
+                    uint64_t start_id2 = match_bank.walk2(match_id).front();
+                    auto it = query_chains2.find(start_id2);
+                    if (it == query_chains2.end()) {
+                        it = query_chains2.emplace(start_id2, std::vector<uint64_t>()).first;
+                        nearest_chains(xmerge2, switch_dists2, tie_rank2, start_id2, it->second);
+                    }
+                    chains2 = &it->second;
+                }
+                
+                query_batch.push_back(QueryItem{match_id, chain1, weight, chains2});
             }
         }
         
@@ -2556,16 +2702,17 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
             // signal the workers to process their chain2 partitions, then process our own
             workers_done.store(0);
             generation.fetch_add(1);
-            run_updates(update_batch, partition_begin[0], partition_end[0]);
-            run_partition(query_batch, partition_begin[0], partition_end[0], thread_results[0]);
+            run_updates(update_batch, partition_begin[0], partition_end[0], thread_num_updates[0]);
+            run_partition(query_batch, partition_begin[0], partition_end[0], thread_results[0],
+                          thread_num_queries[0]);
             // wait for all workers to finish this batch
             while (workers_done.load() != num_threads - 1) {
                 std::this_thread::yield();
             }
         }
         else {
-            run_updates(update_batch, 0, xmerge2.chain_size());
-            run_partition(query_batch, 0, xmerge2.chain_size(), thread_results[0]);
+            run_updates(update_batch, 0, xmerge2.chain_size(), thread_num_updates[0]);
+            run_partition(query_batch, 0, xmerge2.chain_size(), thread_results[0], thread_num_queries[0]);
         }
         // the pending updates have all been flushed into the search trees
         update_batch.clear();
@@ -2588,6 +2735,13 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
         for (auto& worker : workers) {
             worker.join();
         }
+    }
+    
+    if (!suppress_verbose_logging) {
+        uint64_t num_queries = total(thread_num_queries);
+        logging::log(logging::Debug, "Made " + std::to_string(num_queries) + " chain pair queries and " + std::to_string(total(thread_num_updates)) + " updates over "
+                     + std::to_string(xmerge1.chain_size()) + " x " + std::to_string(xmerge2.chain_size())
+                     + " chains" + (limit_chains1 || limit_chains2 ? ", at most " + std::to_string(max_query_chains) + " nearest per graph" : std::string()) + ".");
     }
     
     ScoreFloat min_score = 0.0;
@@ -2674,6 +2828,9 @@ std::vector<anchor_t> Anchorer::traceback_sparse_dp(const std::vector<match_set_
     
     if (debug_anchorer) {
         std::cerr << "doing traceback from opt score " << opt_value << "\n";
+    }
+    if (!suppress_verbose_logging) {
+        logging::log(logging::Debug, "Optimal chain score is " + std::to_string(opt_value) + ".");
     }
     
     // traceback into a chain
