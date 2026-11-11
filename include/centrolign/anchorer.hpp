@@ -1876,8 +1876,11 @@ std::vector<anchor_t> Anchorer::sparse_affine_chain_dp(const std::vector<match_s
     static const ScoreFloat mininf = std::numeric_limits<ScoreFloat>::lowest();
     
     // the D arrays from chandra & jain 2023
-    PostSwitchDistances<DistVector> switch_dists1(graph1, xmerge1);
-    PostSwitchDistances<DistVector> switch_dists2(graph2, xmerge2);
+    PostSwitchDistances<DistVector> switch_dists1(graph1, xmerge1, threads);
+    PostSwitchDistances<DistVector> switch_dists2(graph2, xmerge2, threads);
+    if (!suppress_verbose_logging) {
+        logging::log(logging::Debug, "Computed post switch distances.");
+    }
     
     // the gap contribution from a source anchor
     auto basic_source_shift = [&](uint64_t src_id1, uint64_t src_id2, uint64_t path1, uint64_t path2) -> IntShift {
